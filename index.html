@@ -1,0 +1,401 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#111111">
+<title>Seeing Roundnet – PoC</title>
+<style>
+  :root { --bg:#111; --panel:#1c1c1c; --fg:#f2f2f2; --muted:#9a9a9a; --btn:#2b2b2b; --accent:#ff3b30; --ar:1.7778; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html, body { margin:0; background:var(--bg); color:var(--fg); font-family:-apple-system, system-ui, Segoe UI, Roboto, sans-serif; }
+  body { padding-bottom:env(safe-area-inset-bottom); }
+  header { display:flex; align-items:center; justify-content:space-between; padding:10px 16px; }
+  header h1 { font-size:17px; margin:0; letter-spacing:.3px; }
+  header span { font-size:12px; color:var(--muted); }
+  #stage { position:relative; margin:0 auto; background:#000; aspect-ratio:var(--ar);
+           width:min(100%, calc(62vh * var(--ar))); overflow:hidden; }
+  #stage video, #stage canvas { position:absolute; inset:0; width:100%; height:100%; }
+  #stage video { object-fit:fill; }
+  #view { touch-action:none; }
+  #placeholder { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+                 color:var(--muted); font-size:14px; text-align:center; padding:16px; pointer-events:none; }
+  #recBadge { position:absolute; top:8px; left:8px; background:var(--accent); color:#fff; font-size:13px;
+              font-weight:700; padding:3px 8px; border-radius:6px; display:none; }
+  .panel { padding:10px 16px; display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  button, .filebtn { background:var(--btn); color:var(--fg); border:0; border-radius:10px; padding:10px 14px;
+                     font-size:15px; font-weight:600; cursor:pointer; min-height:44px; }
+  button:disabled { opacity:.35; }
+  button.active { background:#fff; color:#111; }
+  .filebtn input { display:none; }
+  #rec { background:var(--accent); color:#fff; flex:1 1 100%; font-size:17px; }
+  #rec.recording { background:#fff; color:var(--accent); }
+  .row { display:flex; gap:8px; align-items:center; width:100%; }
+  #scrub { flex:1; accent-color:var(--accent); }
+  #time { font-variant-numeric:tabular-nums; font-size:13px; color:var(--muted); min-width:96px; text-align:right; }
+  .swatch { width:44px; padding:0; }
+  .swatch i { display:inline-block; width:18px; height:18px; border-radius:50%; vertical-align:middle; }
+  .label { font-size:12px; color:var(--muted); width:100%; margin-top:2px; }
+  #info { font-size:12px; color:var(--muted); padding:0 16px 8px; }
+  #banner, #result { margin:10px 16px; background:var(--panel); border-radius:12px; padding:12px; display:none; }
+  #result video { width:100%; border-radius:8px; background:#000; margin-bottom:8px; }
+  #result p, #banner p { margin:0 0 8px; font-size:14px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Seeing Roundnet</h1>
+  <span>Proof of concept</span>
+</header>
+
+<div id="banner">
+  <p>An unsaved recording from a previous session was found.</p>
+  <button id="recover">Recover it</button>
+  <button id="dismiss">Discard</button>
+</div>
+
+<div id="stage">
+  <video id="video" playsinline muted preload="auto"></video>
+  <canvas id="view"></canvas>
+  <div id="placeholder">Load a video to start</div>
+  <div id="recBadge">● REC 00:00</div>
+</div>
+
+<div class="panel">
+  <div class="row">
+    <input id="scrub" type="range" min="0" max="0" step="0.001" value="0" disabled>
+    <span id="time">0.00 / 0.00</span>
+  </div>
+
+  <label class="filebtn" id="loadBtn">Load video<input id="file" type="file" accept="video/*"></label>
+  <button id="back" disabled aria-label="Previous frame">◀︎ frame</button>
+  <button id="play" disabled>Play</button>
+  <button id="fwd" disabled aria-label="Next frame">frame ▶︎</button>
+
+  <div class="label">Speed</div>
+  <button class="speed" data-v="0.25" disabled>0.25×</button>
+  <button class="speed" data-v="0.5" disabled>0.5×</button>
+  <button class="speed active" data-v="1" disabled>1×</button>
+
+  <div class="label">Drawing</div>
+  <button id="pen" class="active" disabled>Pen on</button>
+  <button class="swatch active" data-c="#ff3b30" disabled aria-label="Red"><i style="background:#ff3b30"></i></button>
+  <button class="swatch" data-c="#ffd60a" disabled aria-label="Yellow"><i style="background:#ffd60a"></i></button>
+  <button class="swatch" data-c="#ffffff" disabled aria-label="White"><i style="background:#fff"></i></button>
+  <button id="undo" disabled>Undo</button>
+  <button id="clear" disabled>Clear</button>
+
+  <button id="rec" disabled>● Start recording</button>
+</div>
+
+<div id="info"></div>
+
+<div id="result">
+  <p id="resultText"></p>
+  <video id="preview" playsinline controls></video>
+  <button id="save">Save / Share video</button>
+  <button id="discard">Discard</button>
+</div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const video = $('video'), view = $('view'), ctx = view.getContext('2d');
+  const ink = document.createElement('canvas'), ictx = ink.getContext('2d');
+  const MAX_SIDE = 1280;          // cap resolution to keep memory low on phones
+  const FPS = 30;
+
+  let strokes = [], current = null, penOn = true, color = '#ff3b30';
+  let recorder = null, chunks = [], micStream = null, recStart = 0, timer = null;
+  let resultFile = null, resultUrl = null;
+
+  // ---------- Small IndexedDB store: recording is saved chunk by chunk ----------
+  const db = {
+    _p: null,
+    open() {
+      return this._p || (this._p = new Promise((res, rej) => {
+        const r = indexedDB.open('seeing-roundnet', 1);
+        r.onupgradeneeded = () => r.result.createObjectStore('chunks', { keyPath: 'i' });
+        r.onsuccess = () => res(r.result);
+        r.onerror = () => rej(r.error);
+      }));
+    },
+    async run(mode, fn) {
+      const d = await this.open();
+      return new Promise((res, rej) => {
+        const t = d.transaction('chunks', mode);
+        const req = fn(t.objectStore('chunks'));
+        t.oncomplete = () => res(req ? req.result : undefined);
+        t.onerror = () => rej(t.error);
+      });
+    },
+    put(item) { return this.run('readwrite', s => s.put(item)); },
+    clear() { return this.run('readwrite', s => s.clear()); },
+    all() { return this.run('readonly', s => s.getAll()); }
+  };
+  const safe = p => p.catch(err => console.warn('Storage:', err));
+
+  // ---------- Helpers ----------
+  const fmt = t => (isFinite(t) ? t : 0).toFixed(2);
+  const controls = () => [...document.querySelectorAll('.panel button, #scrub')];
+  function enable(on) { controls().forEach(el => el.disabled = !on); }
+  function setInfo(extra = '') {
+    const type = pickType() || 'browser default';
+    const size = view.width ? `${view.width}×${view.height}` : '–';
+    $('info').textContent = `Export format: ${type} · Resolution: ${size}${extra ? ' · ' + extra : ''}`;
+  }
+  function pickType() {
+    if (!window.MediaRecorder) return '';
+    const candidates = [
+      'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
+      'video/mp4',
+      'video/webm;codecs=vp9,opus',
+      'video/webm;codecs=vp8,opus',
+      'video/webm'
+    ];
+    return candidates.find(t => MediaRecorder.isTypeSupported(t)) || '';
+  }
+
+  // ---------- Load video ----------
+  $('file').addEventListener('change', e => {
+    const f = e.target.files[0];
+    if (!f) return;
+    if (video.src) URL.revokeObjectURL(video.src);
+    video.src = URL.createObjectURL(f);
+    video.load();
+    e.target.value = '';
+  });
+
+  video.addEventListener('loadedmetadata', () => {
+    let w = video.videoWidth, h = video.videoHeight;
+    const s = Math.min(1, MAX_SIDE / Math.max(w, h));
+    w = Math.round(w * s / 2) * 2;   // even sizes: required by video encoders
+    h = Math.round(h * s / 2) * 2;
+    view.width = ink.width = w;
+    view.height = ink.height = h;
+    document.documentElement.style.setProperty('--ar', w / h);
+    $('placeholder').style.display = 'none';
+    $('scrub').max = video.duration;
+    strokes = []; redrawInk();
+    video.currentTime = 0.001;        // forces iOS to decode the first frame
+    enable(true);
+    setInfo();
+  });
+
+  // ---------- Render loop: video frame + drawings into one canvas ----------
+  function loop() {
+    if (view.width) {
+      ctx.fillStyle = '#000';
+      ctx.fillRect(0, 0, view.width, view.height);
+      if (video.readyState >= 2) ctx.drawImage(video, 0, 0, view.width, view.height);
+      ctx.drawImage(ink, 0, 0);
+      if (document.activeElement !== $('scrub')) $('scrub').value = video.currentTime;
+      $('time').textContent = `${fmt(video.currentTime)} / ${fmt(video.duration)}`;
+    }
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+
+  // ---------- Playback ----------
+  $('play').onclick = () => video.paused ? video.play() : video.pause();
+  video.addEventListener('play', () => $('play').textContent = 'Pause');
+  video.addEventListener('pause', () => $('play').textContent = 'Play');
+  video.addEventListener('ended', () => $('play').textContent = 'Play');
+
+  function step(dir) {
+    video.pause();
+    video.currentTime = Math.max(0, Math.min(video.duration, video.currentTime + dir / FPS));
+  }
+  $('back').onclick = () => step(-1);
+  $('fwd').onclick = () => step(1);
+  $('scrub').addEventListener('input', e => { video.currentTime = +e.target.value; });
+
+  document.querySelectorAll('.speed').forEach(b => b.onclick = () => {
+    video.playbackRate = video.defaultPlaybackRate = +b.dataset.v;
+    document.querySelectorAll('.speed').forEach(x => x.classList.toggle('active', x === b));
+  });
+
+  // ---------- Drawing ----------
+  function pos(e) {
+    const r = view.getBoundingClientRect();
+    return [(e.clientX - r.left) * view.width / r.width, (e.clientY - r.top) * view.height / r.height];
+  }
+  function style(s) {
+    ictx.strokeStyle = s.color; ictx.lineWidth = s.w; ictx.lineCap = 'round'; ictx.lineJoin = 'round';
+  }
+  function drawStroke(s) {
+    style(s);
+    ictx.beginPath();
+    s.pts.forEach((p, i) => i ? ictx.lineTo(p[0], p[1]) : ictx.moveTo(p[0], p[1]));
+    if (s.pts.length === 1) ictx.lineTo(s.pts[0][0] + 0.1, s.pts[0][1]);
+    ictx.stroke();
+  }
+  function redrawInk() {
+    ictx.clearRect(0, 0, ink.width, ink.height);
+    strokes.forEach(drawStroke);
+  }
+  view.addEventListener('pointerdown', e => {
+    if (!penOn || !view.width) return;
+    e.preventDefault();
+    view.setPointerCapture(e.pointerId);
+    current = { color, w: Math.max(3, view.width / 220), pts: [pos(e)] };
+    strokes.push(current);
+    drawStroke(current);
+  });
+  view.addEventListener('pointermove', e => {
+    if (!current) return;
+    const p = pos(e), q = current.pts[current.pts.length - 1];
+    current.pts.push(p);
+    style(current);
+    ictx.beginPath(); ictx.moveTo(q[0], q[1]); ictx.lineTo(p[0], p[1]); ictx.stroke();
+  });
+  ['pointerup', 'pointercancel'].forEach(t => view.addEventListener(t, () => current = null));
+
+  $('pen').onclick = () => {
+    penOn = !penOn;
+    $('pen').textContent = penOn ? 'Pen on' : 'Pen off';
+    $('pen').classList.toggle('active', penOn);
+  };
+  document.querySelectorAll('.swatch').forEach(b => b.onclick = () => {
+    color = b.dataset.c;
+    document.querySelectorAll('.swatch').forEach(x => x.classList.toggle('active', x === b));
+  });
+  $('undo').onclick = () => { strokes.pop(); redrawInk(); };
+  $('clear').onclick = () => { strokes = []; redrawInk(); };
+
+  // ---------- Recording ----------
+  $('rec').onclick = () => (recorder && recorder.state === 'recording') ? stopRec() : startRec();
+
+  async function startRec() {
+    if (!view.captureStream || !window.MediaRecorder) {
+      alert('This browser cannot record video from the page.');
+      return;
+    }
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true }
+      });
+    } catch (err) {
+      alert('Microphone access is needed to record your voice.\n' + err.message);
+      return;
+    }
+    const stream = view.captureStream(FPS);
+    micStream.getAudioTracks().forEach(t => stream.addTrack(t));
+
+    const type = pickType();
+    try {
+      recorder = new MediaRecorder(stream, type ? { mimeType: type, videoBitsPerSecond: 5000000 } : {});
+    } catch (err) {
+      recorder = new MediaRecorder(stream);
+    }
+
+    chunks = [];
+    hideResult();
+    await safe(db.clear());
+
+    recorder.ondataavailable = async e => {
+      if (!e.data || !e.data.size) return;
+      const i = chunks.length;
+      chunks.push(e.data);
+      // back up each chunk as it arrives, so a crash never loses the take
+      try {
+        const buf = await e.data.arrayBuffer();
+        await db.put({ i, buf, type: recorder.mimeType || e.data.type });
+      } catch (err) { console.warn('Backup failed', err); }
+    };
+    recorder.onstop = finishRec;
+    recorder.onerror = e => alert('Recording error: ' + ((e.error && e.error.message) || e.type));
+
+    recorder.start(1000);   // one chunk per second
+    recStart = Date.now();
+    $('rec').textContent = '■ Stop recording';
+    $('rec').classList.add('recording');
+    $('recBadge').style.display = 'block';
+    $('loadBtn').style.pointerEvents = 'none';
+    $('loadBtn').style.opacity = .35;
+    timer = setInterval(() => {
+      const s = Math.floor((Date.now() - recStart) / 1000);
+      $('recBadge').textContent = `● REC ${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
+    }, 250);
+  }
+
+  function stopRec() {
+    if (recorder && recorder.state !== 'inactive') recorder.stop();
+  }
+
+  function finishRec() {
+    clearInterval(timer);
+    if (micStream) micStream.getTracks().forEach(t => t.stop());
+    $('rec').textContent = '● Start recording';
+    $('rec').classList.remove('recording');
+    $('recBadge').style.display = 'none';
+    $('loadBtn').style.pointerEvents = '';
+    $('loadBtn').style.opacity = '';
+    if (!chunks.length) { alert('Nothing was recorded.'); return; }
+    const type = recorder.mimeType || chunks[0].type || 'video/mp4';
+    showResult(new Blob(chunks, { type }), (Date.now() - recStart) / 1000);
+  }
+
+  // ---------- Result / export ----------
+  function fileName(type) {
+    const d = new Date(), p = n => String(n).padStart(2, '0');
+    const ext = type.includes('mp4') ? 'mp4' : 'webm';
+    return `seeing-roundnet-${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}.${ext}`;
+  }
+
+  function showResult(blob, seconds) {
+    if (resultUrl) URL.revokeObjectURL(resultUrl);
+    resultUrl = URL.createObjectURL(blob);
+    resultFile = new File([blob], fileName(blob.type), { type: blob.type.split(';')[0] });
+    $('preview').src = resultUrl;
+    const mb = (blob.size / 1048576).toFixed(1);
+    $('resultText').textContent = `Recording ready · ${seconds ? Math.round(seconds) + ' s · ' : ''}${mb} MB · ${resultFile.type}`;
+    $('result').style.display = 'block';
+    $('result').scrollIntoView({ behavior: 'smooth' });
+    setInfo(`Last file: ${mb} MB`);
+  }
+  function hideResult() { $('result').style.display = 'none'; }
+
+  function download() {
+    const a = document.createElement('a');
+    a.href = resultUrl; a.download = resultFile.name;
+    document.body.appendChild(a); a.click(); a.remove();
+  }
+
+  $('save').onclick = async () => {
+    if (!resultFile) return;
+    if (navigator.canShare && navigator.canShare({ files: [resultFile] })) {
+      try {
+        await navigator.share({ files: [resultFile] });
+        safe(db.clear());
+      } catch (err) {
+        if (err.name !== 'AbortError') download();
+      }
+    } else {
+      download();
+      safe(db.clear());
+    }
+  };
+  $('discard').onclick = () => {
+    if (!confirm('Delete this recording?')) return;
+    hideResult(); safe(db.clear());
+  };
+
+  // ---------- Recover an unsaved recording after a crash ----------
+  safe(db.all().then(items => {
+    if (!items || !items.length) return;
+    $('banner').style.display = 'block';
+    $('recover').onclick = () => {
+      items.sort((a, b) => a.i - b.i);
+      const blob = new Blob(items.map(x => x.buf), { type: items[0].type || 'video/mp4' });
+      $('banner').style.display = 'none';
+      showResult(blob);
+    };
+    $('dismiss').onclick = () => { $('banner').style.display = 'none'; safe(db.clear()); };
+  }));
+
+  setInfo();
+})();
+</script>
+</body>
+</html>
