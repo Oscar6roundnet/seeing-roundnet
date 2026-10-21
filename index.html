@@ -333,7 +333,51 @@
     $('loadBtn').style.opacity = '';
     if (!chunks.length) { alert('Nothing was recorded.'); return; }
     const type = recorder.mimeType || chunks[0].type || 'video/mp4';
-    showResult(new Blob(chunks, { type }), (Date.now() - recStart) / 1000);
+    finalize(new Blob(chunks, { type }), (Date.now() - recStart) / 1000);
+  }
+
+  // ---------- Convert the raw recording into a standard MP4 ----------
+  // Browsers write "fragmented" files with no total duration in the header:
+  // WhatsApp rejects them and players show 0:00. We rebuild a regular MP4
+  // (H.264 + AAC, duration and index at the start of the file).
+  let mediabunny = null;
+  async function toStandardMp4(blob, onProgress) {
+    mediabunny = mediabunny || await import('https://cdn.jsdelivr.net/npm/mediabunny@1/+esm');
+    const { Input, Output, Conversion, ALL_FORMATS, BlobSource, BufferTarget, Mp4OutputFormat } = mediabunny;
+    const input = new Input({ source: new BlobSource(blob), formats: ALL_FORMATS });
+    const output = new Output({
+      format: new Mp4OutputFormat({ fastStart: 'in-memory' }),
+      target: new BufferTarget()
+    });
+    // Already H.264/AAC (Android, iPhone): tracks are copied as they are, which is fast.
+    // Other codecs (e.g. WebM): re-encoded with the phone's own encoder.
+    const conversion = await Conversion.init({
+      input, output,
+      video: { codec: 'avc' },
+      audio: { codec: 'aac' }
+    });
+    if (!conversion.isValid) throw new Error('This recording cannot be converted on this device.');
+    conversion.onProgress = onProgress;
+    await conversion.execute();
+    return new Blob([output.target.buffer], { type: 'video/mp4' });
+  }
+
+  async function finalize(raw, seconds) {
+    $('resultText').textContent = 'Preparing video…';
+    $('preview').removeAttribute('src');
+    $('save').disabled = true;
+    $('result').style.display = 'block';
+    try {
+      const mp4 = await toStandardMp4(raw, p => {
+        $('resultText').textContent = `Preparing video… ${Math.round(p * 100)}%`;
+      });
+      showResult(mp4, seconds);
+    } catch (err) {
+      console.warn('Conversion failed', err);
+      showResult(raw, seconds, 'Not converted: ' + (err.message || err));
+    } finally {
+      $('save').disabled = false;
+    }
   }
 
   // ---------- Result / export ----------
@@ -343,13 +387,14 @@
     return `seeing-roundnet-${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}.${ext}`;
   }
 
-  function showResult(blob, seconds) {
+  function showResult(blob, seconds, warning) {
     if (resultUrl) URL.revokeObjectURL(resultUrl);
     resultUrl = URL.createObjectURL(blob);
     resultFile = new File([blob], fileName(blob.type), { type: blob.type.split(';')[0] });
     $('preview').src = resultUrl;
     const mb = (blob.size / 1048576).toFixed(1);
-    $('resultText').textContent = `Recording ready · ${seconds ? Math.round(seconds) + ' s · ' : ''}${mb} MB · ${resultFile.type}`;
+    $('resultText').textContent = `Recording ready · ${seconds ? Math.round(seconds) + ' s · ' : ''}${mb} MB · ${resultFile.type}`
+      + (warning ? ` · ⚠︎ ${warning}` : ' · standard MP4');
     $('result').style.display = 'block';
     $('result').scrollIntoView({ behavior: 'smooth' });
     setInfo(`Last file: ${mb} MB`);
@@ -389,7 +434,7 @@
       items.sort((a, b) => a.i - b.i);
       const blob = new Blob(items.map(x => x.buf), { type: items[0].type || 'video/mp4' });
       $('banner').style.display = 'none';
-      showResult(blob);
+      finalize(blob);
     };
     $('dismiss').onclick = () => { $('banner').style.display = 'none'; safe(db.clear()); };
   }));
